@@ -61,6 +61,32 @@ class JsonLogger:
         self.close()
 
 
+class RawRewardTracker(gym.Wrapper):
+    """Injects unnormalized per-episode rewards into info dict regardless of external early stops."""
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._episode_raw_return = 0.0
+
+    def reset(self, **kwargs):
+        observation, info = self.env.reset(**kwargs)
+        self._episode_raw_return = 0.0
+        return observation, info
+
+    def step(self, action):
+        observation, reward, terminated, truncated, info = self.env.step(action)
+        self._episode_raw_return += reward
+        info = dict(info) if info else {}
+        info["raw_episode_return"] = self._episode_raw_return
+        info["raw_step_reward"] = reward
+        if terminated or truncated:
+            episode_info = info.get("episode")
+            if isinstance(episode_info, dict):
+                episode_info["raw_return"] = self._episode_raw_return
+            self._episode_raw_return = 0.0
+        return observation, reward, terminated, truncated, info
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="RL algorithms with PyTorch in MuJoCo environments (step-based driver)"
@@ -163,10 +189,10 @@ def parse_args() -> argparse.Namespace:
         help="Max steps during evaluation rollouts (defaults to max_step)",
     )
     parser.add_argument(
-        "--tune_eval_window_episodes",
+        "--tune_eval_window_steps",
         type=int,
-        default=100,
-        help="Episodes reserved for evaluations in tune mode",
+        default=100_000,
+        help="Training steps reserved for evaluations in tune mode",
     )
     parser.add_argument(
         "--checkpoint_freq",
@@ -178,7 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval_freq",
         type=int,
-        default=10000,
+        default=20000,
         help="Evaluation frequency in steps",
         )
 
@@ -385,8 +411,27 @@ def build_experiment_name(params: Dict[str, Any]) -> str:
         *sorted(key for key in params if key not in priority_keys),
     ]
     parts = []
-    ppo_keys = ["sample_size", "clip_param", "target_kl", "policy_lr", "vf_lr", "gamma", "lam"]
-    trpo_keys = ["sample_size", "delta", "backtrack_iter", "backtrack_coeff", "backtrack_alpha", "gamma", "lam"]
+    ppo_keys = [
+        "sample_size",
+        "clip_param",
+        "target_kl",
+        "policy_lr",
+        "vf_lr",
+        "train_policy_iters",
+        "train_vf_iters",
+        "gamma",
+        "lam",
+    ]
+    trpo_keys = [
+        "sample_size",
+        "delta",
+        "backtrack_iter",
+        "backtrack_coeff",
+        "backtrack_alpha",
+        "train_vf_iters",
+        "gamma",
+        "lam",
+    ]
 
     for key in ordered_keys:
         value = params[key]
@@ -432,6 +477,7 @@ def main():
     render_mode = "human" if args.render else None
     env = gym.make(args.env, render_mode=render_mode)
     env = Monitor(env)
+    env = RawRewardTracker(env)
     env = NormalizeObservation(env)
     env = NormalizeReward(env)
 
@@ -470,7 +516,7 @@ def main():
         "eval_mode": args.evaluation_mode,
         "eval_episodes": args.eval_episodes,
         "eval_step_limit": eval_step_limit,
-        "tune_eval_window": args.tune_eval_window_episodes,
+        "tune_eval_window_steps": args.tune_eval_window_steps,
         **agent_hparams,
     }
     experiment_name = build_experiment_name(experiment_params)
@@ -487,8 +533,7 @@ def main():
 
     os.makedirs(os.path.abspath(args.save_model_dir), exist_ok=True)
     
-    expected_total_episodes = max(1, int(np.ceil(args.total_train_steps / max(args.max_step, 1))))
-    tune_eval_threshold = max(expected_total_episodes - args.tune_eval_window_episodes, 0)
+    tune_eval_step_threshold = max(args.total_train_steps - args.tune_eval_window_steps, 0)
 
     total_num_steps = 0
     train_sum_returns = 0.0
@@ -553,17 +598,24 @@ def main():
                         tensorboard_writer.add_scalar(
                             "Train/Alpha", getattr(agent, "alpha"), total_num_steps
                         )
+                    if "BacktrackIter" in agent.logger:
+                        tensorboard_writer.add_scalar("Train/BacktrackIter", agent.logger["BacktrackIter"], total_num_steps)
 
             should_evaluate = False
             if args.phase == "test":
                 should_evaluate = True
-            elif args.evaluation_mode == "compare" and total_num_steps >= next_eval_step:
+            elif args.evaluation_mode == "compare" and  total_num_steps >= next_eval_step:
                 should_evaluate = True
                 next_eval_step += args.eval_freq
-            elif args.evaluation_mode == "tune" and train_num_episodes >= tune_eval_threshold:
+            elif (
+                args.evaluation_mode == "tune"
+                and total_num_steps >= tune_eval_step_threshold
+                and total_num_steps >= next_eval_step
+            ):
                 should_evaluate = True
+                next_eval_step += args.eval_freq
 
-            if should_evaluate:
+            if should_evaluate or total_num_steps >= args.total_train_steps:
                 eval_metrics = evaluate_agent(agent, args.eval_episodes, eval_step_limit)
                 eval_metrics.update(
                     {
@@ -586,11 +638,32 @@ def main():
             if args.phase == "test":
                 break
 
-            if (
-                args.phase == "train"
-                and args.load is None
-                and total_num_steps >= next_checkpoint_step
-            ):
+            if args.phase == "train" and args.load is None:
+                checkpoint_due = total_num_steps >= next_checkpoint_step
+                within_tune_window = (
+                    args.evaluation_mode != "tune"
+                    or total_num_steps >= tune_eval_step_threshold
+                )
+                if checkpoint_due and within_tune_window:
+                    if last_eval_metrics is None:
+                        last_eval_metrics = evaluate_agent(
+                            agent, args.eval_episodes, eval_step_limit
+                        )
+                    avg_return = last_eval_metrics["average_return"]
+                    checkpoint_name = (
+                        f"{experiment_name}__steps={total_num_steps}__avg={avg_return:.2f}.pt"
+                    )
+                    checkpoint_path = os.path.join(args.save_model_dir, checkpoint_name)
+                    torch.save(agent.policy.state_dict(), checkpoint_path)
+                    logger.log(
+                        "checkpoint",
+                        {
+                            "checkpoint_path": checkpoint_path,
+                            "total_steps": total_num_steps,
+                            "average_return": avg_return,
+                        },
+                    )
+                    next_checkpoint_step += args.checkpoint_freq
                 if last_eval_metrics is None:
                     last_eval_metrics = evaluate_agent(agent, args.eval_episodes, eval_step_limit)
                 avg_return = last_eval_metrics["average_return"]

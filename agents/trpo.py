@@ -165,6 +165,7 @@ class Agent(object):
       adv = batch['adv']
       
       batch_size = obs.shape[0]
+      self.backtrack_iters.clear()
 
       minibatch_size = self.minibatch_size if self.minibatch_size > 0 else batch_size
 
@@ -259,6 +260,7 @@ class Agent(object):
    def run(self, max_step):
       step_number = 0
       total_reward = 0.
+      info = {}
 
       # === [FIX 2] ===
       # Handle seeding and new reset() return values
@@ -315,18 +317,37 @@ class Agent(object):
                self.train_model()
                self.steps = 0
 
+         total_reward += reward
          step_number += 1
          obs = next_obs
-      total_reward += info['episode']['r']
+      if isinstance(info, dict):
+         episode_info = info.get("episode")
+         raw_episode_return = None
+         if isinstance(episode_info, dict):
+            raw_episode_return = episode_info.get("raw_return", None)
+         if raw_episode_return is None:
+            raw_episode_return = info.get("raw_episode_return", None)
+         if raw_episode_return is not None:
+            total_reward = raw_episode_return
+         elif isinstance(episode_info, dict) and "r" in episode_info:
+            total_reward = episode_info["r"]
+         self.logger['RawReturn'] = float(raw_episode_return) if raw_episode_return is not None else float(total_reward)
+      else:
+         self.logger['RawReturn'] = float(total_reward)
       
       # Save logs
       if len(self.policy_losses) > 0:
          self.logger['LossPi'] = round(np.mean(self.policy_losses), 5)
          self.logger['LossV'] = round(np.mean(self.vf_losses), 5)
          self.logger['KL'] = round(np.mean(self.kls), 5)
+         if len(self.backtrack_iters) > 0:
+            self.logger['BacktrackIter'] = round(np.mean(self.backtrack_iters), 5)
+         else:
+            self.logger['BacktrackIter'] = 0.0
       else:
          # Log 0.0 if no training has occurred in this episode
          self.logger['LossPi'] = 0.0
          self.logger['LossV'] = 0.0
          self.logger['KL'] = 0.0
+         self.logger['BacktrackIter'] = 0.0
       return step_number, total_reward

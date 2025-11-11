@@ -2,7 +2,7 @@
 
 # --- Parameters to loop over ---
 ENVS=("HalfCheetah-v5" "Ant-v5")
-SEEDS=(19 26)
+SEEDS=(26)
 ALGOS=("ppo" "trpo")
 
 # PPO hyperparameter grid
@@ -25,8 +25,8 @@ COMMON_ARGS=(
   "--total_train_steps=1000000"
   "--steps_per_iter=5000"
   "--evaluation_mode=tune"
-  "--tune_eval_window_steps=100000"
-  "--eval_freq=20000"
+  "--tune_eval_window_episodes=100"
+  "--eval_freq=50000"
   "--checkpoint_freq=200000"
   "--tensorboard"
 )
